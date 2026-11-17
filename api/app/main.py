@@ -23,7 +23,8 @@ DESCRIPTION = """
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
   产出**独立只读**实例；跨点后才提交的事务不会出现；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项：接单原子化，并发新建/重试同一时刻只确认一条进行中任务，
+  其余请求 409 且不留抢占队列；失败或重启后可按原核对点重试。
 """
 
 
@@ -101,7 +102,7 @@ async def lifespan(_app: FastAPI):
             recoverer.stop_instance(j["data_dir"])
 
 
-app = FastAPI(title="水质数仓 PITR 恢复服务", version="1.0.0",
+app = FastAPI(title="水质数仓 PITR 恢复服务", version="1.1.0",
               description=DESCRIPTION, lifespan=lifespan)
 
 
@@ -121,14 +122,17 @@ def _cp_or_404(name: str) -> dict:
     return cp
 
 
-def _ensure_no_active_job() -> None:
-    active = ",".join(f"'{s}'" for s in state.ACTIVE_JOB_STATES)
-    j = state.one_row(f"SELECT id, status FROM jobs WHERE status IN ({active})"
-                      " ORDER BY id DESC LIMIT 1")
-    if j:
+def _admit_or_409(checkpoint_name: str) -> int:
+    """原子接单：同一时刻只确认一条进行中任务，冲突返回 409（不留队列）。"""
+    jid, conflict = state.try_admit_job(checkpoint_name)
+    if conflict:
         raise HTTPException(
-            409, f"已有进行中的恢复任务 #{j['id']}（{j['status']}），一次只恢复一项"
+            409,
+            f"已有进行中的恢复任务 #{conflict['id']}"
+            f"（核对点 {conflict['checkpoint_name']}，状态 {conflict['status']}），"
+            "一次只恢复一项，请待其结束后再发起",
         )
+    return jid
 
 
 # ------------------------------------------------------------------ 基础
@@ -211,17 +215,12 @@ def get_checkpoint(name: str):
 # ------------------------------------------------------------------ 恢复任务
 
 @app.post("/api/recoveries", tags=["recovery"], status_code=202,
-          summary="按核对点发起恢复（一次只恢复一项）")
+          summary="按核对点发起恢复（一次只恢复一项，并发仅一条 202）")
 def start_recovery(body: RecoveryIn):
     cp = _cp_or_404(body.checkpoint)
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
-    _ensure_no_active_job()
-    jid = state.execute(
-        "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
-        " VALUES (?,?,?,?)",
-        (body.checkpoint, "queued", state.now(), state.now()),
-    )
+    jid = _admit_or_409(body.checkpoint)
     return state.one_row("SELECT * FROM jobs WHERE id=?", (jid,))
 
 
@@ -236,7 +235,7 @@ def get_recovery(job_id: int):
 
 
 @app.post("/api/recoveries/{job_id}/retry", tags=["recovery"], status_code=202,
-          summary="按原核对点重试（失败/取消/被取代后）")
+          summary="按原核对点重试（失败/取消/被取代后，并发仅一条 202）")
 def retry_recovery(job_id: int):
     job = _job_or_404(job_id)
     if job["status"] not in state.RETRYABLE_JOB_STATES:
@@ -244,12 +243,7 @@ def retry_recovery(job_id: int):
     cp = _cp_or_404(job["checkpoint_name"])
     if cp["status"] == "expired":
         raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
-    _ensure_no_active_job()
-    jid = state.execute(
-        "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
-        " VALUES (?,?,?,?)",
-        (job["checkpoint_name"], "queued", state.now(), state.now()),
-    )
+    jid = _admit_or_409(job["checkpoint_name"])
     return state.one_row("SELECT * FROM jobs WHERE id=?", (jid,))
 
 

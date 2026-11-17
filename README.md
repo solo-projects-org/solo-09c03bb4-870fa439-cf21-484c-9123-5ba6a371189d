@@ -10,13 +10,15 @@
 - 恢复结果只含核对点前已提交的数据，**跨点后才提交的事务不会出现**；
 - 查询只打恢复实例，**绝不用当前源库冒充恢复结果**；
 - WAL 未归档齐备时任务显示等待、不开放目标查询；
-- 失败或 API 重启后可按原核对点重试；一次只恢复一项；全程不改写生产库。
+- 失败或 API 重启后可按原核对点重试；一次只恢复一项：并发接单同一时刻
+  只确认一条进行中任务，其余请求 409 且不留稍后抢占的队列；全程不改写生产库。
 
 ## 快速开始
 
 ```bash
 docker compose up -d --build        # 启动源库 + API（首次自动做基准备份）
 python3 scripts/demo.py             # 端到端演示：更正 / 误删 / 跨点事务 + 恢复校验
+python3 scripts/selftest_single_active.py   # 并发接单 / 重试 / 重启去重 自测
 ```
 
 Swagger 文档：<http://localhost:8000/docs>
@@ -58,8 +60,8 @@ Swagger 文档：<http://localhost:8000/docs>
 | 不用源库冒充恢复 | 查询连接的是 `/recoveries/job-N` 下独立实例（端口 55433），响应中标注实例与 as-of LSN |
 | WAL 未齐备显示等待 | 核对点 `waiting_wal` 状态；任务逐段核对"备份起点→核对点"全部 WAL 段，缺段时停留 `waiting_wal` 并列出缺失段 |
 | 不把半库报成功 | pause 后校验 `pg_last_wal_replay_lsn() >= 核对点 LSN` 才 promote；再查 `samples`  sanity + `default_transaction_read_only=on` 才置 `ready`；任何异常 → `failed` + 日志 |
-| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时进行中任务自动重新排队、ready 实例自动拉起 |
-| 一次只恢复一项 | 有进行中任务时 `POST /api/recoveries` 返回 409；新任务就绪前会把旧 ready 实例停掉并标记 `superseded` |
+| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时若有多条历史待办，仅保留最早接单的一条续跑，其余标记 `cancelled` 及未执行原因；ready 实例自动拉起 |
+| 一次只恢复一项 | 接单原子化（`BEGIN IMMEDIATE` 单事务"查进行中+插 queued"，另有唯一部分索引 `idx_jobs_single_active` 兜底）：并发新建/重试同一时刻只确认一条进行中任务，其余返回 409 且**不留待执行队列**；新任务就绪前会把旧 ready 实例停掉并标记 `superseded` |
 | 源库可写、不被改写 | 基准备份/恢复点均为在线只读操作；API 对源库不执行任何 DML；归档卷对 API 只读挂载 |
 
 ## API 一览
@@ -85,6 +87,7 @@ queued → waiting_wal → preparing → recovering → verifying → ready
            (等待WAL归档齐备)                            ↘ failed（可 retry）
 ready --(新任务就绪前)--> superseded        ready --(DELETE)--> stopped
 进行中 --(DELETE)--> cancelled             API 重启：进行中→重新排队；ready→自动拉起
+重启时发现多条进行中：仅最早一条重新排队，其余 cancelled（标注未执行原因，可再重试）
 ```
 
 ## 手动操作示例（curl）
@@ -127,3 +130,18 @@ curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 - 并发第二个恢复请求返回 409；新任务就绪时旧实例被 `superseded`；
 - 恢复实例直连写入被数据库拒绝（read-only transaction），`/query` 非 SELECT 与多语句被 400 拦截；
 - 强制重做基准备份后旧核对点自动 `expired`，恢复过期核对点返回 409。
+
+### 并发接单修复（v1.1.0）验证
+
+针对"同时提交两个恢复请求可能都返回 202、第二条稍后抢占第一条结果"的修复：
+
+- 本地线程级测试（Python 3.11 / SQLite 3.40，33 项断言全过）：16 线程并发
+  `try_admit_job` 仅 1 条成交、其余拿到冲突；唯一部分索引阻止第二条活跃任务；
+  任务终结/ready 后可再次接单；重启去重仅保留最早一条、其余 `cancelled` 含未执行
+  原因；`resume_after_restart` 清理孤儿实例并续跑幸存者；端点级（stub 掉
+  psycopg/fastapi 后直接调用 `main.start_recovery` / `main.retry_recovery`）
+  8/6/4 路并发均只有一条 202、其余 409 且 jobs 表不留多余行；
+- Compose 端到端自测 `scripts/selftest_single_active.py`：8 路并发新建仅一条
+  202、ready 后可再发起且源库可写、6 路并发重试仅一条 202、向 SQLite 预置多条
+  历史待办后 `docker compose restart api` 仅最早一条续跑至 ready（就绪查询对应
+  原核对点），其余标记未执行原因。

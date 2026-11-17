@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+# DB 级兜底：同一时刻至多一条进行中任务。
+# 接单本身由 try_admit_job 在单个事务里原子完成；该唯一部分索引用于
+# 防住任何绕过接单路径的写入（如旧版本遗留代码），并在重启去重后重建。
+GUARD_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_single_active
+ON jobs ((1))
+WHERE status IN ('queued','waiting_wal','preparing','recovering','verifying')
+"""
+
 # 进行中（未终结）的任务状态：一次只允许一个
 ACTIVE_JOB_STATES = ("queued", "waiting_wal", "preparing", "recovering", "verifying")
 # 允许发起重试的终结状态
@@ -72,7 +81,67 @@ def init_db() -> None:
         con = _connect()
         try:
             con.executescript(SCHEMA)
+            _enforce_single_active(con)  # 重启去重，须在唯一索引之前
+            con.execute(GUARD_INDEX)
             con.commit()
+        finally:
+            con.close()
+
+
+def _enforce_single_active(con: sqlite3.Connection) -> None:
+    """重启去重：历史遗留多条进行中任务时，仅继续最早接单的一条。
+
+    其余标记 cancelled 并写明未执行原因（属于可重试状态，可按原核对点重试）。
+    被保留任务的核对点不变，续跑就绪后查询照常对应。
+    """
+    active = ",".join(f"'{s}'" for s in ACTIVE_JOB_STATES)
+    rows = con.execute(
+        f"SELECT id FROM jobs WHERE status IN ({active}) ORDER BY id"
+    ).fetchall()
+    if len(rows) <= 1:
+        return
+    keep = rows[0]["id"]
+    losers = [r["id"] for r in rows[1:]]
+    marks = ",".join("?" for _ in losers)
+    con.execute(
+        f"UPDATE jobs SET status='cancelled', cancel_requested=0, updated_at=?,"
+        f" detail=? WHERE id IN ({marks})",
+        (now(),
+         f"未执行：重启时发现 {len(rows)} 条进行中任务，同一时刻只允许一条，"
+         f"仅保留最早接单的 #{keep}；可按原核对点重试",
+         *losers),
+    )
+
+
+def try_admit_job(checkpoint_name: str) -> tuple[int | None, dict | None]:
+    """原子接单：同一时刻只确认一条进行中任务。
+
+    "查进行中 + 插入 queued" 放在同一个 BEGIN IMMEDIATE 事务里，
+    并发新建 / 按原点重试只会放行一条；其余返回冲突（调用方给 409），
+    不会留下稍后抢占恢复实例的待执行队列。
+    返回 (新任务 id, None)；已有进行中任务时返回 (None, 该任务)。
+    """
+    active = ",".join(f"'{s}'" for s in ACTIVE_JOB_STATES)
+    with _LOCK:
+        con = sqlite3.connect(config.STATE_DB, timeout=30, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                f"SELECT id, checkpoint_name, status FROM jobs"
+                f" WHERE status IN ({active}) ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row:
+                con.execute("ROLLBACK")
+                return None, dict(row)
+            cur = con.execute(
+                "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
+                " VALUES (?,?,?,?)",
+                (checkpoint_name, "queued", now(), now()),
+            )
+            con.execute("COMMIT")
+            return cur.lastrowid, None
         finally:
             con.close()
 

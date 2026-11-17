@@ -27,7 +27,11 @@ class Cancelled(Exception):
 # ---------------------------------------------------------------- 调度
 
 def dispatch_loop(stop: threading.Event) -> None:
-    """串行调度：同一时间只运行一个恢复任务。"""
+    """串行调度：同一时间只运行一个恢复任务。
+
+    接单侧（state.try_admit_job + 唯一部分索引）保证 queued 至多一条，
+    不存在多条待执行任务排队抢占恢复实例的情况。
+    """
     runner: threading.Thread | None = None
     while not stop.is_set():
         try:
@@ -49,15 +53,26 @@ def dispatch_loop(stop: threading.Event) -> None:
 def resume_after_restart() -> None:
     """API 重启后的状态修复。
 
-    - 进行中的任务：重新排队，按原核对点从头重试（幂等，数据目录会重建）；
+    - state.init_db 已完成去重：多条历史进行中任务仅保留最早接单的一条，
+      其余标记 cancelled 及未执行原因；
+    - 这里先停掉所有非 ready 任务遗留的恢复实例（含被去重取消任务的孤儿
+      进程，防止占用端口/目录），再把唯一保留的进行中任务重新排队，
+      按原核对点从头重试（幂等，数据目录会重建）；
     - 已 ready 的任务：数据目录仍在，直接拉起实例继续提供只读查询。
     """
+    # 1) 清理孤儿恢复实例：非 ready 任务的实例一律停掉（幂等）
+    for j in state.all_rows(
+        "SELECT * FROM jobs WHERE data_dir IS NOT NULL AND status != 'ready'"
+    ):
+        stop_instance(j["data_dir"])
+    # 2) 唯一保留的进行中任务：重新排队，按原核对点自动重试
     active = ",".join(f"'{s}'" for s in state.ACTIVE_JOB_STATES)
-    for j in state.all_rows(f"SELECT * FROM jobs WHERE status IN ({active})"):
-        if j.get("data_dir"):
-            stop_instance(j["data_dir"])  # 防御：进程一般已随重启消失
+    for j in state.all_rows(
+        f"SELECT * FROM jobs WHERE status IN ({active}) ORDER BY id"
+    ):
         state.update_job(j["id"], status="queued", cancel_requested=0,
                          detail="API 重启，按原核对点自动重试")
+    # 3) 已 ready 的任务：拉起实例继续提供只读查询
     for j in state.all_rows("SELECT * FROM jobs WHERE status='ready'"):
         try:
             ddir = j["data_dir"]
